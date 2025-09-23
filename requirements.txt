@@ -1,4 +1,11 @@
+<<<<<<< HEAD
 streamlit
 pandas
 numpy
 matplotlib    # only if you use charts
+=======
+streamlit
+pandas
+numpy
+matplotlib    # only if you use charts
+>>>>>>> 7b1cb07908489def75e345842808adad7c11df7f
