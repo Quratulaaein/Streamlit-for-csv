@@ -54,7 +54,7 @@ df_all = pd.concat(dfs.values(), ignore_index=True)
 
 st.title("Amazon CSV Search (global or per-category)")
 if search_all:
-    st.caption("Global search enabled — searches all categories by default")
+    st.caption("")
 else:
     st.caption(f"Searching within category: {category}")
 
