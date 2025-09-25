@@ -6,7 +6,6 @@ from typing import Dict
 
 st.set_page_config(page_title="Amazon CSV Search", layout="wide")
 
-# Map categories to CSV files (update paths if your CSVs are elsewhere)
 CSV_FILES: Dict[str, str] = {
     "Laptops": "amazon_results_laptops.csv",
     "Mobiles": "amazon_results_mobilephones.csv",
@@ -14,15 +13,24 @@ CSV_FILES: Dict[str, str] = {
 }
 
 st.sidebar.title("Options")
-category = st.sidebar.selectbox("Category (used when NOT doing a global search)", list(CSV_FILES.keys()))
-search_all = st.sidebar.checkbox("Search across ALL categories (global search)", value=False)
 
-# caching file loads so repeated UI interactions are faster
+# Keep category selector but default to Laptops (used only when NOT doing global search)
+category = st.sidebar.selectbox(
+    "Category (used when NOT doing a global search)",
+    list(CSV_FILES.keys())
+)
+
+# <<< Make global search ON by default by setting value=True >>>
+search_all = st.sidebar.checkbox(
+    "Search across ALL categories (global search)",
+    value=True
+)
+
 @st.cache_data
 def load_csv(path: str) -> pd.DataFrame:
     return pd.read_csv(path)
 
-# Load either the selected CSV or all CSVs combined
+# Load CSVs and add Category column
 missing = []
 dfs = {}
 for cat, path in CSV_FILES.items():
@@ -35,7 +43,6 @@ for cat, path in CSV_FILES.items():
         except Exception as e:
             st.error(f"Error loading {path}: {e}")
             st.stop()
-        # Add a Category column so we know which file each row came from
         df["Category"] = cat
         dfs[cat] = df
 
@@ -43,27 +50,27 @@ if missing:
     st.error(f"CSV file(s) not found: {', '.join(missing)}")
     st.stop()
 
-# Combine all dataframes for global search
 df_all = pd.concat(dfs.values(), ignore_index=True)
 
-# Put a prominent title and a single search box at the top
 st.title("Amazon CSV Search (global or per-category)")
+if search_all:
+    st.caption("Global search enabled — searches all categories by default")
+else:
+    st.caption(f"Searching within category: {category}")
 
+# Place single search box at top. Press Enter to apply.
 query = st.text_input("Enter search term (leave blank to show all rows):").strip()
 
-# decide which DataFrame to search
+# Use global DF if search_all True; otherwise use selected category DF
 if search_all:
-    st.subheader("Searching across ALL categories")
     df_to_search = df_all.copy()
     download_name_prefix = "global"
 else:
-    st.subheader(f"Searching within category: {category}")
     df_to_search = dfs[category].copy()
     download_name_prefix = category.lower()
 
-# If query provided, filter rows where any cell contains the query (case-insensitive)
+# Filter
 if query:
-    # convert dataframe to strings and check each row
     mask = df_to_search.apply(
         lambda row: row.astype(str).str.contains(query, case=False, na=False).any(),
         axis=1
@@ -74,16 +81,14 @@ else:
 
 st.write(f"Showing {len(filtered)} results")
 
-# If global search is enabled show counts by category
+# Show breakdown if global
 if search_all:
     counts = filtered['Category'].value_counts().rename_axis('Category').reset_index(name='Count')
     st.markdown("**Results by category (within filtered set):**")
     st.table(counts)
 
-# show table (use width='stretch' — this will let streamlit stretch the dataframe)
 st.dataframe(filtered, width="stretch")
 
-# Download filtered CSV
 st.download_button(
     "Download results as CSV",
     data=filtered.to_csv(index=False).encode("utf-8"),
