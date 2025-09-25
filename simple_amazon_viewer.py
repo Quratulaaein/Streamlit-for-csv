@@ -52,14 +52,14 @@ if missing:
 
 df_all = pd.concat(dfs.values(), ignore_index=True)
 
-st.title("Amazon CSV Search (global or per-category)")
+st.title("Amazon Products Viewer")
 if search_all:
     st.caption("")
 else:
     st.caption(f"Searching within category: {category}")
 
 # Place single search box at top. Press Enter to apply.
-query = st.text_input("Enter search term (leave blank to show all rows):").strip()
+query = st.text_input("Enter search term").strip()
 
 # Use global DF if search_all True; otherwise use selected category DF
 if search_all:
