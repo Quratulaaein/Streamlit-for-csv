@@ -1,0 +1,472 @@
+# amazon_sony_headphones_scraper_fixed.py
+"""
+Robust Amazon.in iPhone scraper.
+
+- Default scrapes 20 pages (END_PAGE = 20)
+- Normalizes prices (commas, NBSPs, narrow spaces)
+- Filters out EMI/exchange/savings prices and picks true selling price / MRP
+- Writes CSV and dedupes by 'link'
+- Add suitable waits and scrolling to load lazy results
+"""
+
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import time, csv, re, sys, html, random
+from pathlib import Path
+
+# ---------- CONFIG ----------
+QUERY = "sony headphones"                # search term
+START_PAGE = 1
+END_PAGE = 20                    # number of search pages to scan
+OUTPUT_CSV = "amazon_results_sony_headphones_fixed.csv"
+HEADLESS = False                 # set True to run without UI
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+SCROLL_PAUSE = 0.6
+PAGE_PAUSE = (1.2, 2.2)          # random wait between page navigation (min,max)
+CLICK_PAUSE = (0.5, 1.2)
+MAX_RETRIES_NEXT = 3
+DEBUG = False                    # set True to print debug lines for suspicious prices
+
+# ---------- UTIL: price parsing ----------
+PRICE_RE = re.compile(r"(\d+(?:[.,]\d+)*)")
+
+def normalize_number_text(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    # remove currency words/symbols but keep digits and dot/comma
+    # Remove grouping chars: comma, NBSP, narrow NBSP, thin space, etc.
+    for ch in [",", "\u202f", "\xa0", "\u2009", "\u2007", "\u2008", "\u200b", " "]:
+        s = s.replace(ch, "")
+    return s
+
+def parse_amount_int(text):
+    """Return integer rupee amount or None."""
+    if not text:
+        return None
+    s = normalize_number_text(text)
+    m = PRICE_RE.search(s)
+    if not m:
+        # fallback: remove all but digits/dot and try
+        cleaned = re.sub(r"[^\d.]", "", s)
+        if not cleaned:
+            return None
+        try:
+            return int(float(cleaned))
+        except Exception:
+            return None
+    num_str = m.group(1).replace(",", "")
+    try:
+        return int(float(num_str))
+    except Exception:
+        cleaned = re.sub(r"[^\d]", "", num_str)
+        if not cleaned:
+            return None
+        try:
+            return int(float(cleaned))
+        except Exception:
+            return None
+
+# ---------- extract and select functions ----------
+def extract_all_price_texts(card):
+    """Collect price-like strings from a search result card, but prefer currency-bearing lines."""
+    texts = []
+
+    # 1) primary a-offscreen spans
+    try:
+        off = card.find_elements(By.CSS_SELECTOR, "span.a-offscreen")
+        for el in off:
+            txt = (el.get_attribute("textContent") or el.text or "").strip()
+            if txt:
+                texts.append(txt)
+    except Exception:
+        pass
+
+    # 2) crossed/list price selectors
+    try:
+        crossed = card.find_elements(By.CSS_SELECTOR, "span.a-text-price span.a-offscreen, span.a-price.a-text-price span.a-offscreen, span.savingsPercentage")
+        for el in crossed:
+            txt = (el.get_attribute("textContent") or el.text or "").strip()
+            if txt:
+                texts.append(txt)
+    except Exception:
+        pass
+
+    # 3) any element containing rupee symbol (strong)
+    try:
+        rupee_els = card.find_elements(By.XPATH, ".//*[contains(text(),'₹') or contains(text(),'Rs') or contains(text(),'INR')]")
+        for el in rupee_els:
+            txt = (el.get_attribute("textContent") or el.text or "").strip()
+            if txt:
+                texts.append(txt)
+    except Exception:
+        pass
+
+    # 4) fallback: scan innerText lines but only accept lines that mention currency/price words
+    try:
+        raw = card.get_attribute("innerText") or card.text or ""
+        for line in raw.splitlines():
+            line_str = line.strip()
+            if not line_str:
+                continue
+            if ("₹" in line_str) or ("Rs" in line_str) or ("INR" in line_str) or \
+               re.search(r"\b(MRP|Mrp|mrp|List Price|list price|price|was|₹)\b", line_str, flags=re.I):
+                texts.append(line_str)
+    except Exception:
+        pass
+
+    # dedupe and keep order
+    seen = set()
+    out = []
+    for t in texts:
+        if not t:
+            continue
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out
+
+def select_price_and_mrp_from_texts(texts):
+    """
+    Filter and choose selling price and mrp from price-like texts.
+    - exclude EMI/exchange/savings where possible
+    - prefer currency-bearing lines
+    - fallback to threshold filtering if needed
+    """
+    entries = []
+    for t in texts:
+        amt = parse_amount_int(t)
+        if amt is None:
+            continue
+        tl = str(t)
+        tl_low = tl.lower()
+        is_currency = any(sym in tl for sym in ("₹", "rs", "inr"))
+        is_mrp = bool(re.search(r"\b(mrp|m\.r\.p|list price|was|original)\b", tl, flags=re.I))
+        is_emi = bool(re.search(r"\b(emi|no cost emi|emi starts|emi options)\b", tl_low))
+        is_exchange = "exchange" in tl_low
+        is_savings = bool(re.search(r"\b(save|savings|off|discount|savingspercentage)\b", tl_low))
+        entries.append({
+            "amt": int(amt),
+            "text": t,
+            "currency": is_currency,
+            "mrp": is_mrp,
+            "emi": is_emi,
+            "exchange": is_exchange,
+            "savings": is_savings
+        })
+
+    if not entries:
+        return None, None, None, None
+
+    # prefer non-emi/exchange/savings entries
+    candidates = [e for e in entries if not (e["emi"] or e["exchange"] or e["savings"])]
+    if not candidates:
+        candidates = entries
+
+    currency_candidates = [e for e in candidates if e["currency"]]
+    use_list = currency_candidates if currency_candidates else candidates
+
+    unique_amts = sorted({e["amt"] for e in use_list})
+    if not unique_amts:
+        return None, None, None, None
+
+    # If only one possible amount, return it as selling
+    if len(unique_amts) == 1:
+        selling_amt = unique_amts[0]
+        text_candidates = [e for e in use_list if e["amt"] == selling_amt]
+        selling_text = None
+        for tc in text_candidates:
+            if not tc["mrp"]:
+                selling_text = tc["text"]; break
+        if not selling_text:
+            selling_text = text_candidates[0]["text"]
+        return selling_amt, None, selling_text, None
+
+    # multiple amounts: choose min as selling, max as mrp
+    selling_amt = unique_amts[0]
+    mrp_amt = unique_amts[-1]
+
+    # prefer mrp_text from explicit mrp or currency-marked
+    mrp_text = None
+    for e in use_list:
+        if e["amt"] == mrp_amt and e["mrp"]:
+            mrp_text = e["text"]; break
+    if mrp_text is None:
+        for e in use_list:
+            if e["amt"] == mrp_amt and e["currency"]:
+                mrp_text = e["text"]; break
+    if mrp_text is None:
+        mrp_text = next((e["text"] for e in use_list if e["amt"] == mrp_amt), None)
+
+    # selling text: prefer non-mrp entry
+    selling_text = None
+    for e in use_list:
+        if e["amt"] == selling_amt and not e["mrp"]:
+            selling_text = e["text"]; break
+    if selling_text is None:
+        selling_text = next((e["text"] for e in use_list if e["amt"] == selling_amt), None)
+
+    return selling_amt, mrp_amt, selling_text, mrp_text
+
+# ---------- title/link extractor ----------
+def extract_title_and_link(card, debug=False):
+    # try h2 > a first (common)
+    try:
+        h2 = card.find_element(By.TAG_NAME, "h2")
+        a = h2.find_element(By.TAG_NAME, "a")
+        link = a.get_attribute("href") or ""
+        title_text = (a.text or a.get_attribute("aria-label") or "").strip()
+        if title_text:
+            return title_text, link
+    except Exception:
+        pass
+
+    # alternative span-based title
+    try:
+        span = card.find_element(By.CSS_SELECTOR, "span.a-size-medium.a-color-base.a-text-normal")
+        title_text = span.text.strip()
+        asin = card.get_attribute("data-asin")
+        if title_text:
+            if asin:
+                return title_text, f"https://www.amazon.in/dp/{asin}"
+            return title_text, ""
+    except Exception:
+        pass
+
+    # anchor containing /dp/
+    try:
+        a = card.find_element(By.XPATH, ".//a[contains(@href,'/dp/')]")
+        href = a.get_attribute("href") or ""
+        title_text = (a.text or a.get_attribute("aria-label") or "").strip()
+        if title_text:
+            return title_text, href
+    except Exception:
+        pass
+
+    # image alt fallback
+    try:
+        img = card.find_element(By.XPATH, ".//img[@alt]")
+        alt = (img.get_attribute("alt") or "").strip()
+        asin = card.get_attribute("data-asin")
+        if alt:
+            if asin:
+                return alt, f"https://www.amazon.in/dp/{asin}"
+            return alt, ""
+    except Exception:
+        pass
+
+    # data-asin + first text line
+    try:
+        asin = card.get_attribute("data-asin")
+        if asin and len(asin.strip()) > 2:
+            href = f"https://www.amazon.in/dp/{asin}"
+            text_lines = (card.text or "").strip().splitlines()
+            title_text = text_lines[0] if text_lines else asin
+            return title_text, href
+    except Exception:
+        pass
+
+    if debug:
+        try:
+            return "", "", card.get_attribute("innerHTML")
+        except Exception:
+            return "", "", "<no innerHTML>"
+
+    return "", ""
+
+# ---------- scraper ----------
+def dismiss_cookie_banner(driver):
+    # attempt to close cookie / consent popups (different forms)
+    try:
+        # common Amazon cookie accept button
+        btn = driver.find_elements(By.XPATH, "//input[@name='accept'] | //button[contains(text(),'Accept')] | //button[contains(text(),'Accept Cookies')]")
+        for b in btn:
+            try:
+                if b.is_displayed():
+                    b.click()
+                    time.sleep(0.4)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+def scroll_to_load(driver):
+    # progressive scroll to end with small pauses
+    total_h = driver.execute_script("return document.body.scrollHeight")
+    cur = 0
+    steps = 4
+    for i in range(steps):
+        cur = (i + 1) / steps * total_h
+        driver.execute_script("window.scrollTo(0, arguments[0]);", cur)
+        time.sleep(SCROLL_PAUSE)
+
+def scrape_amazon_sony_headphones(query=QUERY, start_page=START_PAGE, end_page=END_PAGE, output_csv=OUTPUT_CSV):
+    opts = Options()
+    if HEADLESS:
+        opts.add_argument("--headless=new")
+    opts.add_argument("--log-level=3")
+    opts.add_argument(f"user-agent={USER_AGENT}")
+    # avoid automation flags that sometimes show
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+
+    driver = webdriver.Chrome(options=opts)
+    wait = WebDriverWait(driver, 12)
+
+    try:
+        driver.get("https://www.amazon.in")
+        time.sleep(1.0)
+        dismiss_cookie_banner(driver)
+
+        # perform search
+        search = wait.until(EC.presence_of_element_located((By.ID, "twotabsearchtextbox")))
+        search.clear()
+        search.send_keys(query)
+        search.send_keys(Keys.RETURN)
+        time.sleep(1.5)
+
+        results = []
+        current_page = start_page
+
+        while current_page <= end_page:
+            print(f"[PAGE] {current_page} -> {driver.current_url}")
+            time.sleep(random.uniform(*PAGE_PAUSE))
+
+            # do extra scrolling & wait
+            scroll_to_load(driver)
+            time.sleep(0.6)
+            try:
+                wait.until(EC.presence_of_all_elements_located((By.XPATH, "//div[@data-component-type='s-search-result']")))
+            except Exception:
+                pass
+
+            cards = driver.find_elements(By.XPATH, "//div[@data-component-type='s-search-result']")
+            print(f"[FOUND] {len(cards)} cards (page {current_page})")
+
+            for idx, card in enumerate(cards, start=1):
+                try:
+                    # quick inner text snippet
+                    try:
+                        inner_snip = (card.get_attribute("innerText") or "")[:400].replace("\n", " | ")
+                    except Exception:
+                        inner_snip = "<no innerText>"
+
+                    title, link = extract_title_and_link(card)
+                    if not title:
+                        if DEBUG:
+                            print(f"[SKIP] idx={idx} - NO TITLE - inner: {inner_snip[:250]}")
+                        continue
+
+                    # get price-like strings and parse
+                    price_texts = extract_all_price_texts(card)
+                    selling_amt, mrp_amt, selling_txt, mrp_txt = select_price_and_mrp_from_texts(price_texts)
+
+                    # debug print if suspicious
+                    if DEBUG and (selling_amt is None or (isinstance(selling_amt, int) and selling_amt < 10000)):
+                        print("[DEBUG PRICE] idx:", idx, "title:", title[:120])
+                        print("  price_texts:", price_texts)
+                        print("  parsed selling_amt:", selling_amt, "mrp_amt:", mrp_amt, "selling_txt:", selling_txt)
+
+                    # defensive fallback: if no selling_amt found, pick first numeric token that's >= threshold
+                    if selling_amt is None and price_texts:
+                        for t in price_texts:
+                            v = parse_amount_int(t)
+                            if v and v >= 1000:
+                                selling_amt = v
+                                selling_txt = t
+                                break
+
+                    discount_pct = ""
+                    if mrp_amt and selling_amt:
+                        try:
+                            discount_pct = round(((mrp_amt - selling_amt) / mrp_amt) * 100, 2)
+                        except Exception:
+                            discount_pct = ""
+
+                    results.append({
+                        "title": title,
+                        "price": selling_amt if selling_amt is not None else "",
+                        "mrp": mrp_amt if mrp_amt is not None else "",
+                        "discount_percentage": discount_pct,
+                        "link": link or ""
+                    })
+
+                    print(f"[ADD] {len(results)}: {title[:60]} | price={selling_amt} | mrp={mrp_amt} | disc%={discount_pct}")
+                except Exception as e:
+                    print("[WARN] card parse error:", str(e)[:200])
+                    continue
+
+            # try clicking next page
+            if current_page >= end_page:
+                break
+
+            clicked = False
+            for attempt in range(MAX_RETRIES_NEXT):
+                try:
+                    next_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "a.s-pagination-next")))
+                    driver.execute_script("arguments[0].click();", next_btn)
+                    time.sleep(random.uniform(*CLICK_PAUSE))
+                    clicked = True
+                    break
+                except Exception:
+                    # try scroll then attempt again
+                    scroll_to_load(driver)
+                    time.sleep(1.0)
+            if not clicked:
+                # fallback: try build next page url by adding &page=
+                try:
+                    base = driver.current_url.split("?")[0]
+                    # Amazon uses query params; use page param if present
+                    # Attempt to navigate by appending &page=
+                    next_url = driver.current_url
+                    if "page=" in next_url:
+                        # increment page param
+                        next_url = re.sub(r"(page=)(\d+)", lambda m: f"page={int(m.group(2))+1}", next_url)
+                    else:
+                        sep = "&" if "?" in next_url else "?"
+                        next_url = next_url + f"{sep}page={current_page+1}"
+                    driver.get(next_url)
+                    time.sleep(random.uniform(*PAGE_PAUSE))
+                    clicked = True
+                except Exception:
+                    clicked = False
+
+            if not clicked:
+                print("[INFO] Could not navigate to next page; ending early.")
+                break
+
+            current_page += 1
+
+        # dedupe by link if possible
+        deduped = []
+        seen_links = set()
+        for r in results:
+            lk = (r.get("link") or "").strip()
+            if lk:
+                if lk in seen_links:
+                    continue
+                seen_links.add(lk)
+            deduped.append(r)
+
+        # write CSV
+        keys = ["title", "price", "mrp", "discount_percentage", "link"]
+        p_out = Path(output_csv)
+        with p_out.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=keys)
+            writer.writeheader()
+            for row in deduped:
+                writer.writerow(row)
+
+        print(f"✅ Saved {len(deduped)} rows to {output_csv}")
+
+    finally:
+        driver.quit()
+
+# ---------- main ----------
+if __name__ == "__main__":
+    scrape_amazon_sony_headphones()
