@@ -1,0 +1,336 @@
+# amazon_mobiles_scraper.py
+# Scrape Amazon.in search results for "mobile" (or any query you set)
+# Outputs CSV with: title, price, link, mrp, discount_percentage
+
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import time, csv, re, urllib.parse, html
+
+# ---------- CONFIG ----------
+QUERY = "mobile"
+START_PAGE = 1
+END_PAGE = 20
+OUTPUT_CSV = "amazon_results_mobilephones.csv"
+HEADLESS = False
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+SCROLL_PAUSE = 0.9
+MAX_RETRIES_NEXT = 3
+
+# ---------- HELPERS ----------
+AMT_RE = re.compile(r"[\d,]+(?:\.\d+)?")
+
+def parse_amount(text):
+    if not text:
+        return None
+    t = text.replace("₹","").replace("Rs.","").replace("Rs","")
+    m = AMT_RE.search(t)
+    if not m:
+        return None
+    s = m.group(0).replace(",", "")
+    try:
+        return int(float(s))
+    except:
+        return None
+
+def extract_prices_from_card(card):
+    discounted_amt = None; mrp_amt = None
+    discounted_text = None; mrp_text = None
+    try:
+        offscreen = card.find_elements(By.CSS_SELECTOR, "span.a-offscreen")
+        parsed = []
+        for el in offscreen:
+            txt = (el.get_attribute("textContent") or el.text or "").strip()
+            if txt:
+                a = parse_amount(txt)
+                if a is not None:
+                    parsed.append((a, txt))
+        if parsed:
+            parsed_sorted = sorted(parsed, key=lambda x: x[0])
+            discounted_amt, discounted_text = parsed_sorted[0]
+            if len(parsed_sorted) > 1:
+                mrp_amt, mrp_text = parsed_sorted[-1]
+            return discounted_amt, mrp_amt, discounted_text, mrp_text
+    except:
+        pass
+    try:
+        mrp_el = card.find_elements(By.CSS_SELECTOR, "span.a-text-price > span.a-offscreen")
+        if mrp_el:
+            txt = (mrp_el[0].get_attribute("textContent") or mrp_el[0].text or "").strip()
+            mrp_amt = parse_amount(txt); mrp_text = txt
+    except:
+        pass
+    try:
+        whole = card.find_elements(By.CSS_SELECTOR, ".a-price-whole")
+        frac = card.find_elements(By.CSS_SELECTOR, ".a-price-fraction")
+        if whole:
+            w = whole[0].text.strip()
+            f = frac[0].text.strip() if frac else ""
+            txt = w + (("." + f) if f else "")
+            amt = parse_amount(txt)
+            if amt and discounted_amt is None:
+                discounted_amt = amt; discounted_text = txt
+    except:
+        pass
+    if discounted_amt is None:
+        try:
+            el = card.find_element(By.XPATH, ".//*[contains(text(),'₹') or contains(text(),'Rs') or contains(text(),'INR')]")
+            txt = (el.get_attribute("textContent") or el.text or "").strip()
+            amt = parse_amount(txt)
+            if amt:
+                discounted_amt = amt; discounted_text = txt
+        except:
+            pass
+    return discounted_amt, mrp_amt, discounted_text, mrp_text
+
+def extract_title_and_link(card, debug=False):
+    # 1) h2 > a
+    try:
+        h2 = card.find_element(By.TAG_NAME, "h2")
+        a = h2.find_element(By.TAG_NAME, "a")
+        link = a.get_attribute("href") or ""
+        title_text = (a.text or a.get_attribute("aria-label") or "").strip()
+        if title_text:
+            return title_text, link
+    except:
+        pass
+
+    # 2) span with common Amazon title class
+    try:
+        span = card.find_element(By.CSS_SELECTOR, "span.a-size-medium.a-color-base.a-text-normal")
+        title_text = span.text.strip()
+        asin = card.get_attribute("data-asin")
+        if title_text and asin:
+            return title_text, f"https://www.amazon.in/dp/{asin}"
+    except:
+        pass
+
+    # 3) anchors with /dp/
+    try:
+        a = card.find_element(By.XPATH, ".//a[contains(@href,'/dp/')]")
+        href = a.get_attribute("href") or ""
+        title_text = (a.text or a.get_attribute("aria-label") or "").strip()
+        if title_text:
+            return title_text, href
+    except:
+        pass
+
+    # 4) img alt text
+    try:
+        img = card.find_element(By.XPATH, ".//img[@alt]")
+        alt = (img.get_attribute("alt") or "").strip()
+        asin = card.get_attribute("data-asin")
+        if alt and asin:
+            return alt, f"https://www.amazon.in/dp/{asin}"
+    except:
+        pass
+
+    # 5) fallback to data-asin
+    try:
+        asin = card.get_attribute("data-asin")
+        if asin and len(asin) > 2:
+            href = f"https://www.amazon.in/dp/{asin}"
+            text_lines = card.text.strip().splitlines()
+            title_text = text_lines[0] if text_lines else asin
+            return title_text, href
+    except:
+        pass
+
+    if debug:
+        try:
+            return "", "", card.get_attribute("innerHTML")
+        except:
+            return "", "", "<no innerHTML>"
+
+    return "", ""
+
+
+def close_common_popups(driver):
+    selectors = ["input#sp-cc-accept","button#sp-cc-accept","button[aria-label='Accept Cookies']","button[data-action='a-popover-close']","button.a-button-close"]
+    for sel in selectors:
+        try:
+            els = driver.find_elements(By.CSS_SELECTOR, sel)
+            for e in els:
+                if e.is_displayed():
+                    try: e.click(); time.sleep(0.2)
+                    except: pass
+        except: pass
+
+def find_next_button(driver):
+    tries = [(By.CSS_SELECTOR, "ul.a-pagination li.a-last a"),
+             (By.XPATH, "//a[contains(@class,'s-pagination-next')]"),
+             (By.XPATH, "//a[@aria-label='Next']"),
+             (By.XPATH, "//a[contains(text(),'Next')]")]
+    for sel in tries:
+        try:
+            el = driver.find_element(*sel)
+            if el.is_displayed():
+                return el
+        except:
+            pass
+    return None
+
+def scroll_page(driver):
+    last_h = driver.execute_script("return document.body.scrollHeight")
+    driver.execute_script("window.scrollTo(0, 0);"); time.sleep(0.4)
+    step = 800; y = 0
+    while y < last_h:
+        y += step
+        driver.execute_script("window.scrollTo(0, arguments[0]);", y)
+        time.sleep(SCROLL_PAUSE)
+    time.sleep(0.8)
+
+def build_next_url_by_page(current_url, next_page_num):
+    parsed = urllib.parse.urlparse(current_url)
+    q = urllib.parse.parse_qs(parsed.query)
+    for key in ("page","p"):
+        if key in q:
+            q[key] = [str(next_page_num)]
+            new_q = urllib.parse.urlencode(q, doseq=True)
+            return urllib.parse.urlunparse(parsed._replace(query=new_q))
+    q["page"] = [str(next_page_num)]
+    new_q = urllib.parse.urlencode(q, doseq=True)
+    return urllib.parse.urlunparse(parsed._replace(query=new_q))
+
+# ---------- MAIN ----------
+def run_scrape(query, start_page, end_page, output_csv):
+    print(f"Scraping '{query}' pages {start_page}..{end_page} -> {output_csv}")
+    options = Options()
+    if HEADLESS: options.add_argument("--headless=new")
+    options.add_argument("--log-level=3")
+    options.add_argument(f"user-agent={USER_AGENT}")
+    driver = webdriver.Chrome(options=options)
+    wait = WebDriverWait(driver, 12)
+    try:
+        driver.get("https://www.amazon.in")
+        close_common_popups(driver)
+        search_box = wait.until(EC.presence_of_element_located((By.ID, "twotabsearchtextbox")))
+        search_box.clear()
+        search_box.send_keys(query)
+        search_box.send_keys(Keys.RETURN)
+        time.sleep(2)
+        close_common_popups(driver)
+
+        results = []
+        current_page = 1
+        current_url = driver.current_url
+        debug_fail_count = 0
+
+        # quickly go to start_page if needed
+        while current_page < start_page:
+            next_el = find_next_button(driver)
+            if next_el:
+                try:
+                    driver.execute_script("arguments[0].click();", next_el)
+                    time.sleep(3)
+                    current_page += 1
+                    current_url = driver.current_url
+                    continue
+                except:
+                    pass
+            current_page += 1
+            candidate = build_next_url_by_page(current_url, current_page)
+            print("[SKIP] go directly to", candidate)
+            driver.get(candidate)
+            time.sleep(3)
+            current_url = driver.current_url
+
+        while current_page <= end_page:
+            print(f"\n[PAGE] {current_page} -> {driver.current_url}")
+            scroll_page(driver)
+            time.sleep(1)
+            try:
+                wait.until(EC.presence_of_all_elements_located((By.XPATH, "//div[@data-component-type='s-search-result']")))
+            except:
+                pass
+
+            cards = driver.find_elements(By.XPATH, "//div[@data-component-type='s-search-result']")
+            print(f"[FOUND] {len(cards)} cards on page {current_page}")
+
+            sample_debugged = 0
+            for card in cards:
+                title, link = extract_title_and_link(card)
+                if not title and debug_fail_count < 5 and sample_debugged < 2:
+                    debug_fail_count += 1
+                    sample_debugged += 1
+                    try:
+                        inner = card.get_attribute("innerHTML")
+                        print("[DEBUG] failed snippet:", html.escape(inner)[:800])
+                    except:
+                        pass
+
+                if not title:
+                    continue
+
+                if link and any(r.get('link') == link for r in results):
+                    continue
+
+                discounted_amt, mrp_amt, discounted_txt, mrp_txt = extract_prices_from_card(card)
+                discount_pct = ""
+                if mrp_amt and discounted_amt:
+                    try:
+                        discount_pct = round(((mrp_amt - discounted_amt)/mrp_amt)*100, 2)
+                    except:
+                        discount_pct = ""
+
+                price_display = discounted_txt or ""
+                results.append({
+                    "title": title,
+                    "price": price_display,
+                    "link": link,
+                    "mrp": mrp_amt if mrp_amt is not None else "",
+                    "discount_percentage": discount_pct
+                })
+                print(f"[ADD] {len(results)}: {title[:80]} | price={price_display} | mrp={mrp_amt} | disc%={discount_pct}")
+
+            if current_page >= end_page:
+                print("[INFO] reached requested end_page")
+                break
+
+            next_btn = find_next_button(driver)
+            if next_btn:
+                clicked = False
+                for attempt in range(MAX_RETRIES_NEXT):
+                    try:
+                        driver.execute_script("arguments[0].scrollIntoView(true);", next_btn)
+                        time.sleep(0.3)
+                        driver.execute_script("arguments[0].click();", next_btn)
+                        time.sleep(3)
+                        clicked = True
+                        break
+                    except Exception:
+                        time.sleep(0.7)
+                        next_btn = find_next_button(driver)
+                if clicked:
+                    current_page += 1
+                    current_url = driver.current_url
+                    continue
+
+            candidate = build_next_url_by_page(driver.current_url, current_page+1)
+            print("[NAV] fallback next url ->", candidate)
+            driver.get(candidate)
+            time.sleep(3)
+            if driver.current_url == current_url:
+                print("[INFO] Could not navigate to next page. Stopping.")
+                break
+            current_page += 1
+            current_url = driver.current_url
+
+        keys = ["title", "price", "link", "mrp", "discount_percentage"]
+        with open(output_csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=keys)
+            w.writeheader()
+            w.writerows(results)
+
+        print(f"\n✅ Saved {len(results)} rows to {output_csv}")
+    finally:
+        try:
+            driver.quit()
+        except:
+            pass
+
+if __name__ == "__main__":
+    run_scrape(QUERY, START_PAGE, END_PAGE, OUTPUT_CSV)

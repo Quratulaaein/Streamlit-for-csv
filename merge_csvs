@@ -1,0 +1,13 @@
+import pandas as pd
+
+# Load the two CSVs
+mobiles = pd.read_csv("amazon_headphones.csv")
+iphones = pd.read_csv("amazon_results_apple_earbuds_fixed.csv")
+
+# Append iPhones into mobiles
+merged = pd.concat([mobiles, iphones], ignore_index=True)
+
+# Save back to the same file (overwrite)
+merged.to_csv("amazon_headphones.csv", index=False)
+
+print("✅ sony data appended into amazon_headphones.csv")

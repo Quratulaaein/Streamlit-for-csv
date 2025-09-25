@@ -1,0 +1,275 @@
+"""
+One-file runner:
+- Creates DB & table (if possible)
+- Imports 3 CSVs into a single table amazon_products
+- Starts a small Flask API to serve results
+
+Usage:
+  python run_loader_and_api.py
+
+Adjust CSV_FILES paths below or set env vars:
+  DB_USER, DB_PASS, DB_HOST, DB_PORT, DB_NAME
+"""
+
+import os
+import sys
+import re
+import time
+from urllib.parse import quote_plus
+
+import pandas as pd
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import IntegrityError, OperationalError
+from flask import Flask, jsonify, request
+
+# ---------- CONFIG (change paths if your CSVs live elsewhere) ----------
+CSV_FILES = {
+    "headphones": os.path.join(os.getcwd(), "amazon_headphones.csv"),
+    "laptops": os.path.join(os.getcwd(), "amazon_results_laptops.csv"),
+    "mobiles": os.path.join(os.getcwd(), "amazon_results_mobilephones.csv"),
+}
+
+# DB defaults (can be overridden with env vars)
+DB_USER = os.getenv("DB_USER", "scraper")
+DB_PASS = os.getenv("DB_PASS", "StrongPasswordHere!")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "3306")
+DB_NAME = os.getenv("DB_NAME", "amazon_data")
+
+# ---------- HELPERS ----------
+price_re = re.compile(r"([₹RsINR\s]*)?([\d,]+(?:\.\d{1,2})?)")
+
+def parse_price(price_raw):
+    """Return (price_num (float or None), currency string or None)"""
+    if pd.isna(price_raw):
+        return None, None
+    s = str(price_raw).replace("\u00A0", " ").strip()
+    m = price_re.search(s)
+    if not m:
+        return None, None
+    currency_part = (m.group(1) or "").strip()
+    number_part = (m.group(2) or "").replace(",", "")
+    try:
+        return float(number_part), (currency_part if currency_part else None)
+    except:
+        return None, (currency_part if currency_part else None)
+
+def get_engine(user, password, host, port, database=None):
+    """Return SQLAlchemy engine. If database is None, connect without DB specified."""
+    pw = quote_plus(password)
+    if database:
+        uri = f"mysql+mysqlconnector://{user}:{pw}@{host}:{port}/{database}"
+    else:
+        uri = f"mysql+mysqlconnector://{user}:{pw}@{host}:{port}/"
+    return create_engine(uri, pool_recycle=3600, echo=False)
+
+def create_database_if_missing(engine_no_db, db_name):
+    """Create database if it does not exist. Requires privileges for the provided user."""
+    with engine_no_db.connect() as conn:
+        # Check existence
+        rows = conn.execute(text("SHOW DATABASES LIKE :name"), {"name": db_name}).fetchall()
+        if rows:
+            print(f"[INFO] Database '{db_name}' already exists.")
+            return True
+        print(f"[INFO] Creating database '{db_name}' ...")
+        conn.execute(text(f"CREATE DATABASE `{db_name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"))
+        conn.commit()
+        print(f"[OK] Database '{db_name}' created.")
+        return True
+
+def create_table_if_missing(engine):
+    create_table_sql = """
+    CREATE TABLE IF NOT EXISTS amazon_products (
+      id BIGINT AUTO_INCREMENT PRIMARY KEY,
+      source VARCHAR(50) NOT NULL,
+      title TEXT NOT NULL,
+      link TEXT,
+      price_raw VARCHAR(64),
+      price_num DECIMAL(12,2) NULL,
+      currency VARCHAR(8) NULL,
+      scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE KEY ux_source_link (source(20), link(255))
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """
+    with engine.begin() as conn:
+        conn.execute(text(create_table_sql))
+    print("[OK] Table amazon_products ready.")
+
+# ---------- CSV -> DB loader ----------
+def load_csv_to_db(engine, source, csv_path, preview_rows=5):
+    """Load a single CSV into amazon_products table."""
+    if not os.path.exists(csv_path):
+        print(f"[WARN] CSV for {source} not found at: {csv_path} — skipping.")
+        return 0
+
+    print(f"[INFO] Reading {csv_path} ...")
+    try:
+        df = pd.read_csv(csv_path, encoding="utf-8")
+    except Exception as e:
+        print(f"[ERROR] Could not read {csv_path}: {e}")
+        return 0
+
+    # normalize columns (lowercase)
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    if "title" not in df.columns:
+        print(f"[ERROR] CSV {csv_path} missing required 'title' column. Skipping.")
+        return 0
+
+    # Prepare columns
+    df["price_raw"] = df["price"].astype(str) if "price" in df.columns else None
+    if "link" not in df.columns:
+        df["link"] = None
+
+    # parse numeric price and currency
+    parsed = df["price_raw"].apply(lambda x: pd.Series(parse_price(x)))
+    parsed.columns = ["price_num", "currency"]
+    df = pd.concat([df, parsed], axis=1)
+
+    df["source"] = source
+    insert_df = df[["source", "title", "link", "price_raw", "price_num", "currency"]].copy()
+    insert_df = insert_df[insert_df["title"].notna()]
+
+    inserted = 0
+    with engine.begin() as conn:
+        for _, row in insert_df.iterrows():
+            try:
+                conn.execute(
+                    text("""
+                    INSERT INTO amazon_products (source, title, link, price_raw, price_num, currency)
+                    VALUES (:source, :title, :link, :price_raw, :price_num, :currency)
+                    """),
+                    {
+                        "source": row["source"],
+                        "title": str(row["title"]),
+                        "link": row["link"],
+                        "price_raw": row["price_raw"],
+                        "price_num": None if pd.isna(row["price_num"]) else row["price_num"],
+                        "currency": row["currency"],
+                    }
+                )
+                inserted += 1
+            except IntegrityError:
+                # duplicate key on (source, link) - skip
+                continue
+            except Exception as e:
+                print("[ERROR] Insert failed for row:", e)
+                continue
+    print(f"[INFO] Inserted {inserted} rows from {csv_path}")
+    return inserted
+
+# ---------- MAIN runner that creates DB, loads CSVs ----------
+def run_setup_and_load():
+    global DB_USER, DB_PASS, DB_HOST, DB_PORT, DB_NAME
+
+    print("[START] Loader beginning...")
+
+    # Try connecting to DB directly
+    try:
+        engine = get_engine(DB_USER, DB_PASS, DB_HOST, DB_PORT, DB_NAME)
+        # try a quick operation to confirm DB exists & user has privileges
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        print(f"[INFO] Connected to database '{DB_NAME}' as {DB_USER}@{DB_HOST}:{DB_PORT}")
+    except OperationalError as oe:
+        # could be DB not existing or access denied
+        msg = str(oe).lower()
+        # Try connecting without specifying database to create it
+        try:
+            engine_no_db = get_engine(DB_USER, DB_PASS, DB_HOST, DB_PORT, None)
+            # try CREATE DATABASE (requires privilege)
+            create_database_if_missing(engine_no_db, DB_NAME)
+            # now create engine with DB
+            engine = get_engine(DB_USER, DB_PASS, DB_HOST, DB_PORT, DB_NAME)
+        except OperationalError as oe2:
+            print("[FATAL] Could not connect to MySQL with provided credentials.")
+            print("Details:", oe2)
+            print("\nIf you need to create the database manually, in MySQL Workbench run:")
+            print(f"CREATE DATABASE {DB_NAME} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;")
+            print(f"Then ensure user {DB_USER} has privileges or edit DB_USER/DB_PASS environment variables.")
+            sys.exit(1)
+
+    # Ensure table exists
+    create_table_if_missing(engine)
+
+    # Load CSVs
+    total_inserted = 0
+    for source, csv_path in CSV_FILES.items():
+        inserted = load_csv_to_db(engine, source, csv_path)
+        total_inserted += inserted
+
+    print(f"[DONE] Loading completed. Total new rows inserted: {total_inserted}")
+    return engine
+
+# ---------- Flask API ----------
+def create_app(engine):
+    app = Flask(__name__)
+
+    @app.route("/products", methods=["GET"])
+    def products():
+        # Query params: source (headphones|laptops|mobiles), q (search in title), limit, offset
+        source = request.args.get("source")
+        q = request.args.get("q")
+        try:
+            limit = int(request.args.get("limit", 50))
+        except:
+            limit = 50
+        try:
+            offset = int(request.args.get("offset", 0))
+        except:
+            offset = 0
+
+        sql = "SELECT id, source, title, link, price_raw, price_num, currency, scraped_at FROM amazon_products WHERE 1=1"
+        params = {}
+        if source:
+            sql += " AND source = :source"
+            params["source"] = source
+        if q:
+            sql += " AND title LIKE :q"
+            params["q"] = f"%{q}%"
+        sql += " ORDER BY scraped_at DESC LIMIT :limit OFFSET :offset"
+        params["limit"] = limit
+        params["offset"] = offset
+
+        with engine.connect() as conn:
+            rows = conn.execute(text(sql), params).fetchall()
+            keys = rows[0].keys() if rows else ["id","source","title","link","price_raw","price_num","currency","scraped_at"]
+            data = [dict(zip(keys, r)) for r in rows]
+
+        return jsonify(data)
+
+    @app.route("/reload", methods=["POST"])
+    def reload_data():
+        """Reload CSV files into DB (dangerous for production)."""
+        inserted = 0
+        with app.app_context():
+            for source, csv_path in CSV_FILES.items():
+                inserted += load_csv_to_db(app.config["ENGINE"], source, csv_path)
+        return jsonify({"inserted": inserted})
+
+    return app
+
+# ---------- ENTRYPOINT ----------
+if __name__ == "__main__":
+    print("One-file runner for CSV -> MySQL -> Flask API")
+    print("Make sure MySQL is running and the DB credentials are correct.")
+    print("Using DB connection settings:")
+    print(f"  host: {DB_HOST}, port: {DB_PORT}, db: {DB_NAME}, user: {DB_USER}")
+    # If default password is used and you want to override at runtime, prompt:
+    if DB_PASS == "StrongPasswordHere!":
+        maybe = input("DB password is default. Press Enter to keep it or type a different DB password: ").strip()
+        if maybe:
+            DB_PASS = maybe
+
+    engine = run_setup_and_load()
+
+    # attach engine to app so reload endpoint can use it
+    app = create_app(engine)
+    app.config["ENGINE"] = engine
+
+    # Start Flask
+    print("\n[INFO] Starting Flask API at http://127.0.0.1:5000")
+    print("Example endpoints:")
+    print("  GET /products?source=headphones&limit=20")
+    print("  GET /products?q=wireless&limit=30")
+    app.run(host="0.0.0.0", port=5000, debug=True)
