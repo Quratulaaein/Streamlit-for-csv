@@ -9,7 +9,11 @@ st.set_page_config(page_title="Amazon CSV Search", layout="wide")
 CSV_FILES: Dict[str, str] = {
     "Laptops": "amazon_results_laptops.csv",
     "Mobiles": "amazon_results_mobilephones.csv",
-    "Headphones": "amazon_headphones.csv"
+    "Headphones": "amazon_headphones.csv",
+    "Speakers:": "amazon_speaker.csv",
+    "Cameras": "amazon_cameras.csv",
+    "Chargers for Mobiles and Laptops": "amazon_mobile_and_laptop_chargers.csv",
+    "Tablets": "amazon_tablets.csv"
 }
 
 st.sidebar.title("Options")
@@ -22,7 +26,7 @@ category = st.sidebar.selectbox(
 
 # <<< Make global search ON by default by setting value=True >>>
 search_all = st.sidebar.checkbox(
-    "Search across ALL categories (global search)",
+    "Search across ALL categories",
     value=True
 )
 
