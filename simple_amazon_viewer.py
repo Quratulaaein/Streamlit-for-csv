@@ -10,7 +10,7 @@ CSV_FILES: Dict[str, str] = {
     "Laptops": "amazon_results_laptops.csv",
     "Mobiles": "amazon_results_mobilephones.csv",
     "Headphones": "amazon_headphones.csv",
-    "Speakers:": "amazon_speaker.csv",
+    "Speakers": "amazon_speaker.csv",
     "Cameras": "amazon_cameras.csv",
     "Chargers for Mobiles and Laptops": "amazon_mobile_and_laptop_chargers.csv",
     "Tablets": "amazon_tablets.csv"
